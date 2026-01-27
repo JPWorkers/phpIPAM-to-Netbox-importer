@@ -1,5 +1,27 @@
 # phpIPAM to NetBox Migration
 
+## Quick Copy-Paste Summary
+
+Add this to the top of your README for quick reference:
+
+```markdown
+## ⚡ TL;DR
+
+```bash
+# Setup
+chmod +x install-migration-ubuntu.sh && ./install-migration-ubuntu.sh
+
+# Configure (edit tokens in both scripts)
+nano create_netbox_sites.py
+nano migrate_phpipam_to_netbox.py
+
+# Run
+source ./venv/bin/activate
+python3 create_netbox_sites.py      # Create sites first
+python3 migrate_phpipam_to_netbox.py # Then migrate data
+deactivate
+````
+
 ```markdown
 # phpIPAM → NetBox Migration Tool
 
@@ -350,30 +372,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 *   [pynetbox](https://github.com/netbox-community/pynetbox) - NetBox Python API client
 
 ````
-
----
-
-## Quick Copy-Paste Summary
-
-Add this to the top of your README for quick reference:
-
-```markdown
-## ⚡ TL;DR
-
-```bash
-# Setup
-chmod +x install-migration-ubuntu.sh && ./install-migration-ubuntu.sh
-
-# Configure (edit tokens in both scripts)
-nano create_netbox_sites.py
-nano migrate_phpipam_to_netbox.py
-
-# Run
-source ./venv/bin/activate
-python3 create_netbox_sites.py      # Create sites first
-python3 migrate_phpipam_to_netbox.py # Then migrate data
-deactivate
-````
-
-```
-```
