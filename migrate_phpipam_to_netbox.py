@@ -5,7 +5,7 @@ Migrates Sections, VRFs, VLANs, Prefixes, and IP Addresses
 
 Features:
 - Rate limiting to prevent overwhelming NetBox
-- Retry logic for connection errors
+- Smart retry logic (only retries connection errors, not validation errors)
 - Progress tracking
 - Safe to re-run (skips existing items)
 """
@@ -46,11 +46,11 @@ SSL_VERIFY = False       # Set True if using valid SSL certificates
 
 SCOPE_TYPE = "dcim.site"
 
-# Rate limiting settings (adjust if still getting connection errors)
-REQUEST_DELAY = 0.1      # Seconds between API calls (increase if needed)
+# Rate limiting settings
+REQUEST_DELAY = 0.05     # Seconds between API calls
 BATCH_SIZE = 100         # Progress log interval
-RETRY_ATTEMPTS = 5       # Retries for failed requests
-RETRY_DELAY = 10         # Seconds to wait after connection error
+RETRY_ATTEMPTS = 3       # Retries for CONNECTION errors only
+RETRY_DELAY = 5          # Seconds to wait after connection error
 
 # ────────────────────────────────────────────────
 # Logging setup
@@ -92,22 +92,25 @@ def make_slug(name: str) -> str:
     return slug[:50] if slug else "default"
 
 
-def api_call_with_retry(func, *args, **kwargs):
-    """Execute an API call with retry logic"""
-    last_error = None
-    for attempt in range(RETRY_ATTEMPTS):
-        try:
-            time.sleep(REQUEST_DELAY)
-            return func(*args, **kwargs)
-        except (RequestError, requests.exceptions.RequestException) as e:
-            last_error = e
-            if attempt < RETRY_ATTEMPTS - 1:
-                wait_time = RETRY_DELAY * (attempt + 1)  # Exponential backoff
-                logger.warning(f"API call failed (attempt {attempt + 1}/{RETRY_ATTEMPTS}), waiting {wait_time}s: {e}")
-                time.sleep(wait_time)
-            else:
-                raise
-    raise last_error
+def is_connection_error(error) -> bool:
+    """Check if error is a connection/server error (worth retrying)"""
+    error_str = str(error).lower()
+    connection_indicators = [
+        'connection', 'timeout', 'timed out', 'reset', 'refused',
+        'disconnected', 'broken pipe', 'network', 'unreachable',
+        '500', '502', '503', '504', '429'
+    ]
+    return any(indicator in error_str for indicator in connection_indicators)
+
+
+def is_validation_error(error) -> bool:
+    """Check if error is a validation error (not worth retrying)"""
+    error_str = str(error).lower()
+    validation_indicators = [
+        '400', 'already exists', 'duplicate', 'unique constraint',
+        'invalid', 'required', 'must be', 'cannot be'
+    ]
+    return any(indicator in error_str for indicator in validation_indicators)
 
 
 def phpipam_get(endpoint: str, required: bool = True) -> list:
@@ -202,7 +205,8 @@ def get_or_create_vrf(nb, name: str, rd: str = "") -> Optional[int]:
         logger.info(f"Created VRF: {name}")
         return vrf.id
     except RequestError as e:
-        logger.error(f"VRF '{name}' failed: {e}")
+        if not is_validation_error(e):
+            logger.error(f"VRF '{name}' failed: {e}")
         return None
 
 
@@ -251,6 +255,7 @@ def migrate_vrfs(nb):
     
     created = 0
     skipped = 0
+    errors = 0
     
     for v in vrfs:
         name = (v.get("name") or "").strip()
@@ -274,10 +279,17 @@ def migrate_vrfs(nb):
             logger.info(f"Created VRF: {name}")
             created += 1
             
+        except RequestError as e:
+            if is_validation_error(e):
+                skipped += 1  # Already exists or invalid
+            else:
+                errors += 1
+                logger.error(f"VRF '{name}' failed: {e}")
         except Exception as e:
+            errors += 1
             logger.error(f"VRF '{name}' failed: {e}")
     
-    logger.info(f"VRFs Complete: {created} created, {skipped} skipped")
+    logger.info(f"VRFs Complete: {created} created, {skipped} skipped, {errors} errors")
 
 
 def migrate_vlan_groups(nb):
@@ -296,6 +308,7 @@ def migrate_vlan_groups(nb):
     
     created = 0
     skipped = 0
+    errors = 0
     
     for d in domains:
         name = (d.get("name") or "").strip()
@@ -324,9 +337,16 @@ def migrate_vlan_groups(nb):
             created += 1
             
         except RequestError as e:
+            if is_validation_error(e):
+                skipped += 1
+            else:
+                errors += 1
+                logger.error(f"VLAN Group '{name}' failed: {e}")
+        except Exception as e:
+            errors += 1
             logger.error(f"VLAN Group '{name}' failed: {e}")
     
-    logger.info(f"VLAN Groups Complete: {created} created, {skipped} skipped")
+    logger.info(f"VLAN Groups Complete: {created} created, {skipped} skipped, {errors} errors")
 
 
 def migrate_vlans(nb):
@@ -360,7 +380,7 @@ def migrate_vlans(nb):
     for i, v in enumerate(vlans):
         # Progress update
         if i > 0 and i % BATCH_SIZE == 0:
-            logger.info(f"  VLAN Progress: {i}/{total} ({(i/total)*100:.1f}%)")
+            logger.info(f"  VLAN Progress: {i}/{total} ({(i/total)*100:.1f}%) - Created: {created}, Skipped: {skipped}")
         
         # Get VLAN number safely
         vid_raw = v.get("number") or v.get("vlanId") or v.get("id")
@@ -372,7 +392,7 @@ def migrate_vlans(nb):
         except ValueError:
             continue
         
-        name = (v.get("name") or f"vlan-{vid}").strip()
+        name = (v.get("name") or f"vlan-{vid}").strip()[:64]
         phpipam_id = str(v.get("id", vid))
         
         group_id = None
@@ -387,52 +407,79 @@ def migrate_vlans(nb):
             except Exception:
                 pass
         
-        # Retry logic
+        # Check if VLAN already exists (by VID or by Name)
+        try:
+            time.sleep(REQUEST_DELAY)
+            existing = list(nb.ipam.vlans.filter(vid=vid, group_id=group_id))
+            if existing:
+                VLANS_CACHE[phpipam_id] = existing[0].id
+                skipped += 1
+                continue
+            
+            # Also check by name (NetBox requires unique name per group)
+            existing_name = list(nb.ipam.vlans.filter(name=name, group_id=group_id))
+            if existing_name:
+                VLANS_CACHE[phpipam_id] = existing_name[0].id
+                skipped += 1
+                continue
+        except Exception as e:
+            if is_connection_error(e):
+                logger.warning(f"Connection error checking VLAN {vid}, retrying...")
+                time.sleep(RETRY_DELAY)
+                continue
+        
+        if DRY_RUN:
+            logger.debug(f"[DRY] Would create VLAN {vid} - {name}")
+            created += 1
+            continue
+        
+        payload = {
+            "vid": vid,
+            "name": name,
+            "status": "active",
+            "description": (v.get("description") or "")[:200],
+        }
+        if group_id:
+            payload["group"] = group_id
+        
+        # Create VLAN with smart retry
         for attempt in range(RETRY_ATTEMPTS):
             try:
-                time.sleep(REQUEST_DELAY)
-                
-                # Check existing
-                existing = list(nb.ipam.vlans.filter(vid=vid, group_id=group_id))
-                if existing:
-                    VLANS_CACHE[phpipam_id] = existing[0].id
-                    skipped += 1
-                    break
-                
-                if DRY_RUN:
-                    logger.debug(f"[DRY] Would create VLAN {vid} - {name}")
-                    created += 1
-                    break
-                
-                payload = {
-                    "vid": vid,
-                    "name": name[:64],
-                    "status": "active",
-                    "description": (v.get("description") or "")[:200],
-                }
-                if group_id:
-                    payload["group"] = group_id
-                
                 time.sleep(REQUEST_DELAY)
                 created_vlan = nb.ipam.vlans.create(**payload)
                 VLANS_CACHE[phpipam_id] = created_vlan.id
                 created += 1
                 break
                 
-            except Exception as e:
-                if attempt < RETRY_ATTEMPTS - 1:
-                    logger.warning(f"Retry {attempt + 1}/{RETRY_ATTEMPTS} for VLAN {vid}: {e}")
+            except RequestError as e:
+                if is_validation_error(e):
+                    # Already exists or invalid - don't retry
+                    skipped += 1
+                    break
+                elif attempt < RETRY_ATTEMPTS - 1 and is_connection_error(e):
+                    logger.warning(f"Connection error for VLAN {vid}, retry {attempt + 1}/{RETRY_ATTEMPTS}")
                     time.sleep(RETRY_DELAY)
                 else:
                     errors += 1
                     if errors <= 10:
                         logger.error(f"VLAN {vid} failed: {e}")
+                    break
+                    
+            except Exception as e:
+                if attempt < RETRY_ATTEMPTS - 1 and is_connection_error(e):
+                    logger.warning(f"Connection error for VLAN {vid}, retry {attempt + 1}/{RETRY_ATTEMPTS}")
+                    time.sleep(RETRY_DELAY)
+                else:
+                    errors += 1
+                    if errors <= 10:
+                        logger.error(f"VLAN {vid} failed: {e}")
+                    break
     
     logger.info(f"VLANs Complete: {created} created, {skipped} skipped, {errors} errors")
 
 
 def migrate_prefixes(nb):
-    """Migrate prefixes with rate limiting and retries"""
+    """Migrate prefixes with rate limiting and smart retries"""
     logger.info("Migrating Prefixes (Subnets)...")
     
     try:
@@ -463,7 +510,7 @@ def migrate_prefixes(nb):
     for i, s in enumerate(subnets):
         # Progress update
         if i > 0 and i % BATCH_SIZE == 0:
-            logger.info(f"  Prefix Progress: {i}/{total} ({(i/total)*100:.1f}%) - Created: {created}, Skipped: {skipped}, Errors: {errors}")
+            logger.info(f"  Prefix Progress: {i}/{total} ({(i/total)*100:.1f}%) - Created: {created}, Skipped: {skipped}")
         
         subnet = s.get("subnet")
         mask = s.get("mask")
@@ -505,7 +552,7 @@ def migrate_prefixes(nb):
         if vlan_id_phpipam and vlan_id_phpipam in VLANS_CACHE:
             payload["vlan"] = VLANS_CACHE[vlan_id_phpipam]
         
-        # Retry logic
+        # Check and create with smart retry
         for attempt in range(RETRY_ATTEMPTS):
             try:
                 time.sleep(REQUEST_DELAY)
@@ -516,7 +563,7 @@ def migrate_prefixes(nb):
                     break
                 
                 if DRY_RUN:
-                    logger.debug(f"[DRY] Would create prefix: {prefix} (section: {section_name})")
+                    logger.debug(f"[DRY] Would create prefix: {prefix}")
                     created += 1
                     break
                 
@@ -525,20 +572,34 @@ def migrate_prefixes(nb):
                 created += 1
                 break
                 
-            except Exception as e:
-                if attempt < RETRY_ATTEMPTS - 1:
-                    logger.warning(f"Retry {attempt + 1}/{RETRY_ATTEMPTS} for {prefix}: {e}")
+            except RequestError as e:
+                if is_validation_error(e):
+                    skipped += 1
+                    break
+                elif attempt < RETRY_ATTEMPTS - 1 and is_connection_error(e):
+                    logger.warning(f"Connection error for {prefix}, retry {attempt + 1}/{RETRY_ATTEMPTS}")
                     time.sleep(RETRY_DELAY)
                 else:
                     errors += 1
                     if errors <= 20:
                         logger.error(f"Prefix {prefix} failed: {e}")
+                    break
+                    
+            except Exception as e:
+                if attempt < RETRY_ATTEMPTS - 1 and is_connection_error(e):
+                    logger.warning(f"Connection error for {prefix}, retry {attempt + 1}/{RETRY_ATTEMPTS}")
+                    time.sleep(RETRY_DELAY)
+                else:
+                    errors += 1
+                    if errors <= 20:
+                        logger.error(f"Prefix {prefix} failed: {e}")
+                    break
     
     logger.info(f"Prefixes Complete: {created} created, {skipped} skipped, {errors} errors")
 
 
 def migrate_addresses(nb):
-    """Migrate individual IP addresses with rate limiting and retries"""
+    """Migrate individual IP addresses with rate limiting and smart retries"""
     logger.info("Migrating IP Addresses...")
     
     try:
@@ -587,7 +648,7 @@ def migrate_addresses(nb):
         if vrf_id:
             payload["vrf"] = vrf_id
         
-        # Retry logic
+        # Check and create with smart retry
         for attempt in range(RETRY_ATTEMPTS):
             try:
                 time.sleep(REQUEST_DELAY)
@@ -606,14 +667,28 @@ def migrate_addresses(nb):
                 created += 1
                 break
                 
-            except Exception as e:
-                if attempt < RETRY_ATTEMPTS - 1:
-                    logger.warning(f"Retry {attempt + 1}/{RETRY_ATTEMPTS} for {address}: {e}")
+            except RequestError as e:
+                if is_validation_error(e):
+                    skipped += 1
+                    break
+                elif attempt < RETRY_ATTEMPTS - 1 and is_connection_error(e):
+                    logger.warning(f"Connection error for {address}, retry {attempt + 1}/{RETRY_ATTEMPTS}")
                     time.sleep(RETRY_DELAY)
                 else:
                     errors += 1
                     if errors <= 20:
-                        logger.error(f"Failed after {RETRY_ATTEMPTS} attempts: {address} - {e}")
+                        logger.error(f"IP {address} failed: {e}")
+                    break
+                    
+            except Exception as e:
+                if attempt < RETRY_ATTEMPTS - 1 and is_connection_error(e):
+                    logger.warning(f"Connection error for {address}, retry {attempt + 1}/{RETRY_ATTEMPTS}")
+                    time.sleep(RETRY_DELAY)
+                else:
+                    errors += 1
+                    if errors <= 20:
+                        logger.error(f"IP {address} failed: {e}")
+                    break
     
     logger.info(f"IP Addresses Complete: {created} created, {skipped} skipped, {errors} errors")
 
@@ -634,7 +709,7 @@ def main():
         logger.info(f"Mode: {'DRY-RUN (no changes will be made)' if DRY_RUN else 'LIVE MIGRATION'}")
         logger.info(f"phpIPAM: {PHPIPAM['url']}")
         logger.info(f"NetBox:  {NETBOX['url']}")
-        logger.info(f"Rate limiting: {REQUEST_DELAY}s delay, {RETRY_ATTEMPTS} retries")
+        logger.info(f"Rate limiting: {REQUEST_DELAY}s delay, {RETRY_ATTEMPTS} retries for connection errors")
         logger.info("")
         
         # Build caches first
