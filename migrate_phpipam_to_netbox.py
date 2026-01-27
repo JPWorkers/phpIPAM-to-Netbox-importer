@@ -2,6 +2,12 @@
 """
 phpIPAM → NetBox Migration Script
 Migrates Sections, VRFs, VLANs, Prefixes, and IP Addresses
+
+Features:
+- Rate limiting to prevent overwhelming NetBox
+- Retry logic for connection errors
+- Progress tracking
+- Safe to re-run (skips existing items)
 """
 
 import os
@@ -35,16 +41,16 @@ NETBOX = {
     'token':    os.getenv("NETBOX_TOKEN") or "your_netbox_token_here",
 }
 
-DRY_RUN = True          # Set True to preview changes without applying
+DRY_RUN = False          # Set True to preview changes without applying
 SSL_VERIFY = False       # Set True if using valid SSL certificates
 
 SCOPE_TYPE = "dcim.site"
 
-# Rate limiting settings
-REQUEST_DELAY = 0.05     # Seconds between API calls
+# Rate limiting settings (adjust if still getting connection errors)
+REQUEST_DELAY = 0.1      # Seconds between API calls (increase if needed)
 BATCH_SIZE = 100         # Progress log interval
-RETRY_ATTEMPTS = 3       # Retries for failed requests
-RETRY_DELAY = 5          # Seconds to wait after connection error
+RETRY_ATTEMPTS = 5       # Retries for failed requests
+RETRY_DELAY = 10         # Seconds to wait after connection error
 
 # ────────────────────────────────────────────────
 # Logging setup
@@ -84,6 +90,24 @@ def make_slug(name: str) -> str:
     slug = re.sub(r'-+', '-', slug)
     slug = slug.strip('-')
     return slug[:50] if slug else "default"
+
+
+def api_call_with_retry(func, *args, **kwargs):
+    """Execute an API call with retry logic"""
+    last_error = None
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            time.sleep(REQUEST_DELAY)
+            return func(*args, **kwargs)
+        except (RequestError, requests.exceptions.RequestException) as e:
+            last_error = e
+            if attempt < RETRY_ATTEMPTS - 1:
+                wait_time = RETRY_DELAY * (attempt + 1)  # Exponential backoff
+                logger.warning(f"API call failed (attempt {attempt + 1}/{RETRY_ATTEMPTS}), waiting {wait_time}s: {e}")
+                time.sleep(wait_time)
+            else:
+                raise
+    raise last_error
 
 
 def phpipam_get(endpoint: str, required: bool = True) -> list:
@@ -159,10 +183,12 @@ def get_vrf_name(vrf_id: Any) -> Optional[str]:
 
 
 def get_or_create_vrf(nb, name: str, rd: str = "") -> Optional[int]:
+    """Get existing VRF or create new one"""
     if not name:
         return None
     
     try:
+        time.sleep(REQUEST_DELAY)
         vrfs = list(nb.ipam.vrfs.filter(name=name))
         if vrfs:
             return vrfs[0].id
@@ -171,7 +197,8 @@ def get_or_create_vrf(nb, name: str, rd: str = "") -> Optional[int]:
             logger.info(f"[DRY] Would create VRF: {name}")
             return None
         
-        vrf = nb.ipam.vrfs.create(name=name[:100], rd=rd or None)
+        time.sleep(REQUEST_DELAY)
+        vrf = nb.ipam.vrfs.create(name=(name or "")[:100], rd=rd or None)
         logger.info(f"Created VRF: {name}")
         return vrf.id
     except RequestError as e:
@@ -180,6 +207,7 @@ def get_or_create_vrf(nb, name: str, rd: str = "") -> Optional[int]:
 
 
 def get_scope_for_section(nb, section_name: str) -> Tuple[Optional[str], Optional[int]]:
+    """Map phpIPAM section to NetBox site scope"""
     if not section_name:
         return None, None
     
@@ -193,6 +221,7 @@ def get_scope_for_section(nb, section_name: str) -> Tuple[Optional[str], Optiona
         return None, None
     
     try:
+        time.sleep(REQUEST_DELAY)
         sites = list(nb.dcim.sites.filter(name=site_name))
         if not sites:
             logger.warning(f"Site not found: {site_name}")
@@ -207,7 +236,9 @@ def get_scope_for_section(nb, section_name: str) -> Tuple[Optional[str], Optiona
 # Migration Functions
 # ────────────────────────────────────────────────
 def migrate_vrfs(nb):
+    """Migrate VRFs from phpIPAM to NetBox"""
     logger.info("Migrating VRFs...")
+    
     try:
         vrfs = phpipam_get("vrfs/", required=False)
     except Exception as e:
@@ -218,13 +249,39 @@ def migrate_vrfs(nb):
         logger.info("No VRFs to migrate")
         return
     
+    created = 0
+    skipped = 0
+    
     for v in vrfs:
-        name = v.get("name")
-        if name:
-            get_or_create_vrf(nb, name, safe_str(v.get("rd")))
+        name = (v.get("name") or "").strip()
+        if not name:
+            continue
+        
+        try:
+            time.sleep(REQUEST_DELAY)
+            existing = list(nb.ipam.vrfs.filter(name=name))
+            if existing:
+                skipped += 1
+                continue
+            
+            if DRY_RUN:
+                logger.info(f"[DRY] Would create VRF: {name}")
+                created += 1
+                continue
+            
+            time.sleep(REQUEST_DELAY)
+            nb.ipam.vrfs.create(name=name[:100], rd=safe_str(v.get("rd")) or None)
+            logger.info(f"Created VRF: {name}")
+            created += 1
+            
+        except Exception as e:
+            logger.error(f"VRF '{name}' failed: {e}")
+    
+    logger.info(f"VRFs Complete: {created} created, {skipped} skipped")
 
 
 def migrate_vlan_groups(nb):
+    """Migrate L2 Domains as VLAN Groups"""
     logger.info("Migrating VLAN Groups (L2 Domains)...")
     
     try:
@@ -237,32 +294,43 @@ def migrate_vlan_groups(nb):
         logger.info("No VLAN Groups to migrate")
         return
     
+    created = 0
+    skipped = 0
+    
     for d in domains:
         name = (d.get("name") or "").strip()
         if not name:
             continue
         
-        existing = list(nb.ipam.vlan_groups.filter(name=name))
-        if existing:
-            logger.debug(f"VLAN Group exists: {name}")
-            continue
-        
-        if DRY_RUN:
-            logger.info(f"[DRY] Would create VLAN Group: {name}")
-            continue
-        
         try:
+            time.sleep(REQUEST_DELAY)
+            existing = list(nb.ipam.vlan_groups.filter(name=name))
+            if existing:
+                skipped += 1
+                continue
+            
+            if DRY_RUN:
+                logger.info(f"[DRY] Would create VLAN Group: {name}")
+                created += 1
+                continue
+            
+            time.sleep(REQUEST_DELAY)
             nb.ipam.vlan_groups.create(
                 name=name[:100],
                 slug=make_slug(name),
                 description=(d.get("description") or "")[:200]
             )
             logger.info(f"Created VLAN Group: {name}")
+            created += 1
+            
         except RequestError as e:
             logger.error(f"VLAN Group '{name}' failed: {e}")
+    
+    logger.info(f"VLAN Groups Complete: {created} created, {skipped} skipped")
 
 
 def migrate_vlans(nb):
+    """Migrate VLANs from phpIPAM to NetBox"""
     global VLANS_CACHE
     logger.info("Migrating VLANs...")
     
@@ -282,14 +350,28 @@ def migrate_vlans(nb):
     except Exception:
         domains = {}
     
-    for v in vlans:
+    total = len(vlans)
+    logger.info(f"Processing {total} VLANs...")
+    
+    created = 0
+    skipped = 0
+    errors = 0
+    
+    for i, v in enumerate(vlans):
+        # Progress update
+        if i > 0 and i % BATCH_SIZE == 0:
+            logger.info(f"  VLAN Progress: {i}/{total} ({(i/total)*100:.1f}%)")
+        
         # Get VLAN number safely
         vid_raw = v.get("number") or v.get("vlanId") or v.get("id")
         if not vid_raw:
-            logger.warning(f"Skipping VLAN with no ID: {v}")
             continue
         
-        vid = int(vid_raw)
+        try:
+            vid = int(vid_raw)
+        except ValueError:
+            continue
+        
         name = (v.get("name") or f"vlan-{vid}").strip()
         phpipam_id = str(v.get("id", vid))
         
@@ -297,39 +379,60 @@ def migrate_vlans(nb):
         domain_id = str(v.get("domainId") or "")
         if domain_id and domain_id in domains:
             group_name = domains[domain_id]
-            groups = list(nb.ipam.vlan_groups.filter(name=group_name))
-            if groups:
-                group_id = groups[0].id
+            try:
+                time.sleep(REQUEST_DELAY)
+                groups = list(nb.ipam.vlan_groups.filter(name=group_name))
+                if groups:
+                    group_id = groups[0].id
+            except Exception:
+                pass
         
-        # Check existing
-        existing = list(nb.ipam.vlans.filter(vid=vid, group_id=group_id))
-        if existing:
-            logger.debug(f"VLAN exists: {vid} ({name})")
-            VLANS_CACHE[phpipam_id] = existing[0].id
-            continue
-        
-        payload = {
-            "vid": vid,
-            "name": name[:64],
-            "status": "active",
-            "description": (v.get("description") or "")[:200],
-        }
-        if group_id:
-            payload["group"] = group_id
-        
-        if DRY_RUN:
-            logger.info(f"[DRY] Would create VLAN {vid} - {name}")
-            continue
-        
-        try:
-            created = nb.ipam.vlans.create(**payload)
-            VLANS_CACHE[phpipam_id] = created.id
-            logger.info(f"Created VLAN {vid} - {name}")
-        except RequestError as e:
-            logger.error(f"VLAN {vid} failed: {e}")
+        # Retry logic
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                time.sleep(REQUEST_DELAY)
+                
+                # Check existing
+                existing = list(nb.ipam.vlans.filter(vid=vid, group_id=group_id))
+                if existing:
+                    VLANS_CACHE[phpipam_id] = existing[0].id
+                    skipped += 1
+                    break
+                
+                if DRY_RUN:
+                    logger.debug(f"[DRY] Would create VLAN {vid} - {name}")
+                    created += 1
+                    break
+                
+                payload = {
+                    "vid": vid,
+                    "name": name[:64],
+                    "status": "active",
+                    "description": (v.get("description") or "")[:200],
+                }
+                if group_id:
+                    payload["group"] = group_id
+                
+                time.sleep(REQUEST_DELAY)
+                created_vlan = nb.ipam.vlans.create(**payload)
+                VLANS_CACHE[phpipam_id] = created_vlan.id
+                created += 1
+                break
+                
+            except Exception as e:
+                if attempt < RETRY_ATTEMPTS - 1:
+                    logger.warning(f"Retry {attempt + 1}/{RETRY_ATTEMPTS} for VLAN {vid}: {e}")
+                    time.sleep(RETRY_DELAY)
+                else:
+                    errors += 1
+                    if errors <= 10:
+                        logger.error(f"VLAN {vid} failed: {e}")
+    
+    logger.info(f"VLANs Complete: {created} created, {skipped} skipped, {errors} errors")
 
 
 def migrate_prefixes(nb):
+    """Migrate prefixes with rate limiting and retries"""
     logger.info("Migrating Prefixes (Subnets)...")
     
     try:
@@ -350,9 +453,18 @@ def migrate_prefixes(nb):
             return 999
     
     subnets.sort(key=get_prefix_len)
-    logger.info(f"Sorted {len(subnets)} subnets by prefix length")
+    total = len(subnets)
+    logger.info(f"Processing {total} subnets (sorted by prefix length)...")
     
-    for s in subnets:
+    created = 0
+    skipped = 0
+    errors = 0
+    
+    for i, s in enumerate(subnets):
+        # Progress update
+        if i > 0 and i % BATCH_SIZE == 0:
+            logger.info(f"  Prefix Progress: {i}/{total} ({(i/total)*100:.1f}%) - Created: {created}, Skipped: {skipped}, Errors: {errors}")
+        
         subnet = s.get("subnet")
         mask = s.get("mask")
         if not subnet or not mask:
@@ -393,20 +505,36 @@ def migrate_prefixes(nb):
         if vlan_id_phpipam and vlan_id_phpipam in VLANS_CACHE:
             payload["vlan"] = VLANS_CACHE[vlan_id_phpipam]
         
-        try:
-            existing = list(nb.ipam.prefixes.filter(prefix=prefix, vrf_id=vrf_id))
-            if existing:
-                logger.debug(f"Prefix exists: {prefix}")
-                if not DRY_RUN:
-                    existing[0].update(payload)
-            elif DRY_RUN:
-                logger.info(f"[DRY] Would create prefix: {prefix} (section: {section_name})")
-            else:
-                nb.ipam.prefixes.create(**payload)
-                logger.info(f"Created prefix: {prefix}")
+        # Retry logic
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                time.sleep(REQUEST_DELAY)
                 
-        except RequestError as e:
-            logger.error(f"Prefix {prefix} failed: {e}")
+                existing = list(nb.ipam.prefixes.filter(prefix=prefix, vrf_id=vrf_id))
+                if existing:
+                    skipped += 1
+                    break
+                
+                if DRY_RUN:
+                    logger.debug(f"[DRY] Would create prefix: {prefix} (section: {section_name})")
+                    created += 1
+                    break
+                
+                time.sleep(REQUEST_DELAY)
+                nb.ipam.prefixes.create(**payload)
+                created += 1
+                break
+                
+            except Exception as e:
+                if attempt < RETRY_ATTEMPTS - 1:
+                    logger.warning(f"Retry {attempt + 1}/{RETRY_ATTEMPTS} for {prefix}: {e}")
+                    time.sleep(RETRY_DELAY)
+                else:
+                    errors += 1
+                    if errors <= 20:
+                        logger.error(f"Prefix {prefix} failed: {e}")
+    
+    logger.info(f"Prefixes Complete: {created} created, {skipped} skipped, {errors} errors")
 
 
 def migrate_addresses(nb):
@@ -433,7 +561,7 @@ def migrate_addresses(nb):
     for i, addr in enumerate(addresses):
         # Progress update
         if i > 0 and i % BATCH_SIZE == 0:
-            logger.info(f"  Progress: {i}/{total} ({(i/total)*100:.1f}%) - Created: {created}, Skipped: {skipped}, Errors: {errors}")
+            logger.info(f"  IP Progress: {i}/{total} ({(i/total)*100:.1f}%) - Created: {created}, Skipped: {skipped}, Errors: {errors}")
         
         ip = addr.get("ip")
         if not ip:
@@ -473,6 +601,7 @@ def migrate_addresses(nb):
                     created += 1
                     break
                 
+                time.sleep(REQUEST_DELAY)
                 nb.ipam.ip_addresses.create(**payload)
                 created += 1
                 break
@@ -493,12 +622,20 @@ def migrate_addresses(nb):
 # Main Entry Point
 # ────────────────────────────────────────────────
 def main():
+    logger.info("=" * 60)
+    logger.info("  phpIPAM → NetBox Migration Tool")
+    logger.info("=" * 60)
+    
+    # Connect to NetBox
     nb = api(url=NETBOX['url'], token=NETBOX['token'])
     nb.http_session.verify = SSL_VERIFY
     
     try:
-        logger.info("=== Starting phpIPAM → NetBox migration ===")
-        logger.info(f"Mode: {'DRY-RUN' if DRY_RUN else 'LIVE MIGRATION'}")
+        logger.info(f"Mode: {'DRY-RUN (no changes will be made)' if DRY_RUN else 'LIVE MIGRATION'}")
+        logger.info(f"phpIPAM: {PHPIPAM['url']}")
+        logger.info(f"NetBox:  {NETBOX['url']}")
+        logger.info(f"Rate limiting: {REQUEST_DELAY}s delay, {RETRY_ATTEMPTS} retries")
+        logger.info("")
         
         # Build caches first
         build_caches()
@@ -510,13 +647,18 @@ def main():
         migrate_prefixes(nb)
         migrate_addresses(nb)
         
-        logger.info("=== Migration finished ===")
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("  Migration Complete!")
+        logger.info("=" * 60)
         
     except KeyboardInterrupt:
-        logger.warning("Migration interrupted by user")
+        logger.warning("\nMigration interrupted by user (Ctrl+C)")
+        logger.info("You can safely re-run the script - it will skip existing items.")
         sys.exit(130)
     except Exception as e:
         logger.critical(f"Fatal error: {e}", exc_info=True)
+        logger.info("You can safely re-run the script - it will skip existing items.")
         sys.exit(1)
 
 
