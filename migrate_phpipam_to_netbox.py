@@ -6,6 +6,7 @@ Migrates Sections, VRFs, VLANs, Prefixes, and IP Addresses
 Features:
 - Rate limiting to prevent overwhelming NetBox
 - Smart retry logic (only retries connection errors, not validation errors)
+- DNS name sanitization
 - Progress tracking
 - Safe to re-run (skips existing items)
 """
@@ -92,13 +93,33 @@ def make_slug(name: str) -> str:
     return slug[:50] if slug else "default"
 
 
+def sanitize_dns_name(hostname: str) -> str:
+    """Remove invalid characters from DNS name.
+    NetBox only allows: alphanumeric, asterisks, hyphens, periods, underscores
+    """
+    if not hostname:
+        return ""
+    # Only allow valid DNS characters
+    sanitized = re.sub(r'[^a-zA-Z0-9\*\-\._]', '', str(hostname))
+    return sanitized[:255]
+
+
+def sanitize_description(desc: str, max_length: int = 200) -> str:
+    """Sanitize description field"""
+    if not desc:
+        return ""
+    # Remove any problematic characters but keep most text
+    sanitized = str(desc).strip()
+    return sanitized[:max_length]
+
+
 def is_connection_error(error) -> bool:
     """Check if error is a connection/server error (worth retrying)"""
     error_str = str(error).lower()
     connection_indicators = [
         'connection', 'timeout', 'timed out', 'reset', 'refused',
         'disconnected', 'broken pipe', 'network', 'unreachable',
-        '500', '502', '503', '504', '429'
+        '502', '503', '504', '429', 'remotedisconnected'
     ]
     return any(indicator in error_str for indicator in connection_indicators)
 
@@ -108,7 +129,7 @@ def is_validation_error(error) -> bool:
     error_str = str(error).lower()
     validation_indicators = [
         '400', 'already exists', 'duplicate', 'unique constraint',
-        'invalid', 'required', 'must be', 'cannot be'
+        'invalid', 'required', 'must be', 'cannot be', 'not allowed'
     ]
     return any(indicator in error_str for indicator in validation_indicators)
 
@@ -208,6 +229,9 @@ def get_or_create_vrf(nb, name: str, rd: str = "") -> Optional[int]:
         if not is_validation_error(e):
             logger.error(f"VRF '{name}' failed: {e}")
         return None
+    except Exception as e:
+        logger.error(f"VRF '{name}' failed: {e}")
+        return None
 
 
 def get_scope_for_section(nb, section_name: str) -> Tuple[Optional[str], Optional[int]]:
@@ -281,7 +305,7 @@ def migrate_vrfs(nb):
             
         except RequestError as e:
             if is_validation_error(e):
-                skipped += 1  # Already exists or invalid
+                skipped += 1
             else:
                 errors += 1
                 logger.error(f"VRF '{name}' failed: {e}")
@@ -331,7 +355,7 @@ def migrate_vlan_groups(nb):
             nb.ipam.vlan_groups.create(
                 name=name[:100],
                 slug=make_slug(name),
-                description=(d.get("description") or "")[:200]
+                description=sanitize_description(d.get("description"))
             )
             logger.info(f"Created VLAN Group: {name}")
             created += 1
@@ -424,9 +448,8 @@ def migrate_vlans(nb):
                 continue
         except Exception as e:
             if is_connection_error(e):
-                logger.warning(f"Connection error checking VLAN {vid}, retrying...")
+                logger.warning(f"Connection error checking VLAN {vid}, will retry...")
                 time.sleep(RETRY_DELAY)
-                continue
         
         if DRY_RUN:
             logger.debug(f"[DRY] Would create VLAN {vid} - {name}")
@@ -437,7 +460,7 @@ def migrate_vlans(nb):
             "vid": vid,
             "name": name,
             "status": "active",
-            "description": (v.get("description") or "")[:200],
+            "description": sanitize_description(v.get("description")),
         }
         if group_id:
             payload["group"] = group_id
@@ -452,9 +475,12 @@ def migrate_vlans(nb):
                 break
                 
             except RequestError as e:
-                if is_validation_error(e):
-                    # Already exists or invalid - don't retry
-                    skipped += 1
+                error_str = str(e)
+                if '400' in error_str or is_validation_error(e):
+                    if 'already exists' in error_str.lower():
+                        skipped += 1
+                    else:
+                        errors += 1
                     break
                 elif attempt < RETRY_ATTEMPTS - 1 and is_connection_error(e):
                     logger.warning(f"Connection error for VLAN {vid}, retry {attempt + 1}/{RETRY_ATTEMPTS}")
@@ -518,7 +544,7 @@ def migrate_prefixes(nb):
             continue
         
         prefix = f"{subnet}/{mask}"
-        desc = (s.get("description") or "")[:200].strip()
+        desc = sanitize_description(s.get("description"))
         
         # Resolve section name
         section_id = s.get("sectionId")
@@ -573,8 +599,12 @@ def migrate_prefixes(nb):
                 break
                 
             except RequestError as e:
-                if is_validation_error(e):
-                    skipped += 1
+                error_str = str(e)
+                if '400' in error_str or is_validation_error(e):
+                    if 'already exists' in error_str.lower():
+                        skipped += 1
+                    else:
+                        errors += 1
                     break
                 elif attempt < RETRY_ATTEMPTS - 1 and is_connection_error(e):
                     logger.warning(f"Connection error for {prefix}, retry {attempt + 1}/{RETRY_ATTEMPTS}")
@@ -635,9 +665,10 @@ def migrate_addresses(nb):
         vrf_name = get_vrf_name(vrf_id_phpipam)
         vrf_id = get_or_create_vrf(nb, vrf_name) if vrf_name else None
         
-        # Build payload with safe string handling
-        description = (addr.get("description") or addr.get("hostname") or "")[:200]
-        dns_name = (addr.get("hostname") or "")[:255]
+        # Build payload with sanitized strings
+        raw_hostname = addr.get("hostname") or ""
+        description = sanitize_description(addr.get("description") or raw_hostname)
+        dns_name = sanitize_dns_name(raw_hostname)
         
         payload = {
             "address": address,
@@ -668,8 +699,14 @@ def migrate_addresses(nb):
                 break
                 
             except RequestError as e:
-                if is_validation_error(e):
-                    skipped += 1
+                error_str = str(e)
+                if '400' in error_str or is_validation_error(e):
+                    if 'already exists' in error_str.lower():
+                        skipped += 1
+                    else:
+                        errors += 1
+                        if errors <= 10:
+                            logger.warning(f"Validation error for {address}: {e}")
                     break
                 elif attempt < RETRY_ATTEMPTS - 1 and is_connection_error(e):
                     logger.warning(f"Connection error for {address}, retry {attempt + 1}/{RETRY_ATTEMPTS}")
@@ -709,7 +746,7 @@ def main():
         logger.info(f"Mode: {'DRY-RUN (no changes will be made)' if DRY_RUN else 'LIVE MIGRATION'}")
         logger.info(f"phpIPAM: {PHPIPAM['url']}")
         logger.info(f"NetBox:  {NETBOX['url']}")
-        logger.info(f"Rate limiting: {REQUEST_DELAY}s delay, {RETRY_ATTEMPTS} retries for connection errors")
+        logger.info(f"Rate limiting: {REQUEST_DELAY}s delay, {RETRY_ATTEMPTS} retries for connection errors only")
         logger.info("")
         
         # Build caches first
