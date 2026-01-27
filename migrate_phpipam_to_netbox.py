@@ -42,7 +42,7 @@ NETBOX = {
     'token':    os.getenv("NETBOX_TOKEN") or "your_netbox_token_here",
 }
 
-DRY_RUN = False          # Set True to preview changes without applying
+DRY_RUN = True          # Set True to preview changes without applying
 SSL_VERIFY = False       # Set True if using valid SSL certificates
 
 SCOPE_TYPE = "dcim.site"
