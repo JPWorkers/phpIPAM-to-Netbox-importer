@@ -61,7 +61,7 @@ phpipam-to-netbox/
 ### Step 1: Clone the Repository
 
 ```bash
-git clone [https://github.com/YOUR_USERNAME/phpipam-to-netbox.git](https://github.com/JPWorkers/phpIPAM-to-Netbox-importer.git)
+git clone https://github.com/JPWorkers/phpIPAM-to-Netbox-importer.git
 cd phpipam-to-netbox
 ````
 
