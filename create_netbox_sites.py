@@ -26,7 +26,7 @@ NETBOX = {
 }
 
 SSL_VERIFY = False
-DRY_RUN = False  # Set to False to actually create sites
+DRY_RUN = True  # Set to False to actually create sites
 
 # ─────────────────────────────────────────────
 # Helper: Create a valid slug
