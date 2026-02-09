@@ -503,9 +503,12 @@ def migrate_vlans(nb):
     
     logger.info(f"VLANs Complete: {created} created, {skipped} skipped, {errors} errors")
 
-
 def migrate_prefixes(nb):
-    """Migrate prefixes with rate limiting and smart retries"""
+    """Migrate prefixes with rate limiting and smart retries.
+    
+    FIXED: /32 (IPv4) and /128 (IPv6) entries are now created as 
+    IP Addresses instead of Prefixes.
+    """
     logger.info("Migrating Prefixes (Subnets)...")
     
     try:
@@ -529,104 +532,189 @@ def migrate_prefixes(nb):
     total = len(subnets)
     logger.info(f"Processing {total} subnets (sorted by prefix length)...")
     
-    created = 0
+    prefixes_created = 0
+    addresses_created = 0
     skipped = 0
     errors = 0
     
     for i, s in enumerate(subnets):
         # Progress update
         if i > 0 and i % BATCH_SIZE == 0:
-            logger.info(f"  Prefix Progress: {i}/{total} ({(i/total)*100:.1f}%) - Created: {created}, Skipped: {skipped}")
+            logger.info(f"  Subnet Progress: {i}/{total} ({(i/total)*100:.1f}%) - "
+                       f"Prefixes: {prefixes_created}, IPs: {addresses_created}, Skipped: {skipped}")
         
         subnet = s.get("subnet")
         mask = s.get("mask")
         if not subnet or not mask:
             continue
         
-        prefix = f"{subnet}/{mask}"
+        try:
+            mask_int = int(mask)
+        except ValueError:
+            logger.warning(f"Invalid mask '{mask}' for subnet {subnet}, skipping")
+            continue
+        
+        prefix_str = f"{subnet}/{mask}"
         desc = sanitize_description(s.get("description"))
         
-        # Resolve section name
-        section_id = s.get("sectionId")
-        section_name = get_section_name(section_id)
+        # Determine if this is IPv4 or IPv6
+        is_ipv6 = ":" in subnet
+        
+        # ════════════════════════════════════════════════════════════
+        # FIX: Check if this should be an IP Address instead of Prefix
+        # /32 (IPv4) or /128 (IPv6) → Create as IP Address
+        # ════════════════════════════════════════════════════════════
+        is_host_address = (not is_ipv6 and mask_int == 32) or (is_ipv6 and mask_int == 128)
         
         # Resolve VRF
         vrf_id_phpipam = s.get("vrfId")
         vrf_name = get_vrf_name(vrf_id_phpipam)
         vrf_id = get_or_create_vrf(nb, vrf_name) if vrf_name else None
         
-        # Section → Scope mapping
-        scope_type, scope_id = get_scope_for_section(nb, section_name)
-        
-        payload = {
-            "prefix": prefix,
-            "status": "active",
-            "description": desc,
-            "is_pool": s.get("isPool") == "1" or s.get("isFull") == "1",
-            "mark_utilized": s.get("isFull") == "1",
-        }
-        
-        if vrf_id:
-            payload["vrf"] = vrf_id
-        
-        if scope_type and scope_id:
-            payload["scope_type"] = scope_type
-            payload["scope_id"] = scope_id
-        
-        # VLAN association
-        vlan_id_phpipam = str(s.get("vlanId") or "")
-        if vlan_id_phpipam and vlan_id_phpipam in VLANS_CACHE:
-            payload["vlan"] = VLANS_CACHE[vlan_id_phpipam]
-        
-        # Check and create with smart retry
-        for attempt in range(RETRY_ATTEMPTS):
-            try:
-                time.sleep(REQUEST_DELAY)
-                
-                existing = list(nb.ipam.prefixes.filter(prefix=prefix, vrf_id=vrf_id))
-                if existing:
-                    skipped += 1
-                    break
-                
-                if DRY_RUN:
-                    logger.debug(f"[DRY] Would create prefix: {prefix}")
-                    created += 1
-                    break
-                
-                time.sleep(REQUEST_DELAY)
-                nb.ipam.prefixes.create(**payload)
-                created += 1
-                break
-                
-            except RequestError as e:
-                error_str = str(e)
-                if '400' in error_str or is_validation_error(e):
-                    if 'already exists' in error_str.lower():
+        if is_host_address:
+            # ──────────────────────────────────────────────────────
+            # CREATE AS IP ADDRESS
+            # ──────────────────────────────────────────────────────
+            payload = {
+                "address": prefix_str,
+                "status": "active",
+                "description": desc or "Imported from phpIPAM",
+            }
+            if vrf_id:
+                payload["vrf"] = vrf_id
+            
+            # Check and create with smart retry
+            for attempt in range(RETRY_ATTEMPTS):
+                try:
+                    time.sleep(REQUEST_DELAY)
+                    
+                    # Check if IP already exists
+                    existing = list(nb.ipam.ip_addresses.filter(address=subnet, vrf_id=vrf_id))
+                    if existing:
                         skipped += 1
-                    else:
-                        errors += 1
-                    break
-                elif attempt < RETRY_ATTEMPTS - 1 and is_connection_error(e):
-                    logger.warning(f"Connection error for {prefix}, retry {attempt + 1}/{RETRY_ATTEMPTS}")
-                    time.sleep(RETRY_DELAY)
-                else:
-                    errors += 1
-                    if errors <= 20:
-                        logger.error(f"Prefix {prefix} failed: {e}")
+                        break
+                    
+                    if DRY_RUN:
+                        logger.debug(f"[DRY] Would create IP address: {prefix_str}")
+                        addresses_created += 1
+                        break
+                    
+                    time.sleep(REQUEST_DELAY)
+                    nb.ipam.ip_addresses.create(**payload)
+                    addresses_created += 1
+                    logger.debug(f"Created IP address: {prefix_str}")
                     break
                     
-            except Exception as e:
-                if attempt < RETRY_ATTEMPTS - 1 and is_connection_error(e):
-                    logger.warning(f"Connection error for {prefix}, retry {attempt + 1}/{RETRY_ATTEMPTS}")
-                    time.sleep(RETRY_DELAY)
-                else:
-                    errors += 1
-                    if errors <= 20:
-                        logger.error(f"Prefix {prefix} failed: {e}")
+                except RequestError as e:
+                    error_str = str(e)
+                    if '400' in error_str or is_validation_error(e):
+                        if 'already exists' in error_str.lower():
+                            skipped += 1
+                        else:
+                            errors += 1
+                            if errors <= 20:
+                                logger.error(f"IP {prefix_str} failed: {e}")
+                        break
+                    elif attempt < RETRY_ATTEMPTS - 1 and is_connection_error(e):
+                        logger.warning(f"Connection error for {prefix_str}, retry {attempt + 1}/{RETRY_ATTEMPTS}")
+                        time.sleep(RETRY_DELAY)
+                    else:
+                        errors += 1
+                        if errors <= 20:
+                            logger.error(f"IP {prefix_str} failed: {e}")
+                        break
+                        
+                except Exception as e:
+                    if attempt < RETRY_ATTEMPTS - 1 and is_connection_error(e):
+                        logger.warning(f"Connection error for {prefix_str}, retry {attempt + 1}/{RETRY_ATTEMPTS}")
+                        time.sleep(RETRY_DELAY)
+                    else:
+                        errors += 1
+                        if errors <= 20:
+                            logger.error(f"IP {prefix_str} failed: {e}")
+                        break
+        
+        else:
+            # ──────────────────────────────────────────────────────
+            # CREATE AS PREFIX (original behavior)
+            # ──────────────────────────────────────────────────────
+            
+            # Resolve section name
+            section_id = s.get("sectionId")
+            section_name = get_section_name(section_id)
+            
+            # Section → Scope mapping
+            scope_type, scope_id = get_scope_for_section(nb, section_name)
+            
+            payload = {
+                "prefix": prefix_str,
+                "status": "active",
+                "description": desc,
+                "is_pool": s.get("isPool") == "1" or s.get("isFull") == "1",
+                "mark_utilized": s.get("isFull") == "1",
+            }
+            
+            if vrf_id:
+                payload["vrf"] = vrf_id
+            
+            if scope_type and scope_id:
+                payload["scope_type"] = scope_type
+                payload["scope_id"] = scope_id
+            
+            # VLAN association
+            vlan_id_phpipam = str(s.get("vlanId") or "")
+            if vlan_id_phpipam and vlan_id_phpipam in VLANS_CACHE:
+                payload["vlan"] = VLANS_CACHE[vlan_id_phpipam]
+            
+            # Check and create with smart retry
+            for attempt in range(RETRY_ATTEMPTS):
+                try:
+                    time.sleep(REQUEST_DELAY)
+                    
+                    existing = list(nb.ipam.prefixes.filter(prefix=prefix_str, vrf_id=vrf_id))
+                    if existing:
+                        skipped += 1
+                        break
+                    
+                    if DRY_RUN:
+                        logger.debug(f"[DRY] Would create prefix: {prefix_str}")
+                        prefixes_created += 1
+                        break
+                    
+                    time.sleep(REQUEST_DELAY)
+                    nb.ipam.prefixes.create(**payload)
+                    prefixes_created += 1
                     break
+                    
+                except RequestError as e:
+                    error_str = str(e)
+                    if '400' in error_str or is_validation_error(e):
+                        if 'already exists' in error_str.lower():
+                            skipped += 1
+                        else:
+                            errors += 1
+                        break
+                    elif attempt < RETRY_ATTEMPTS - 1 and is_connection_error(e):
+                        logger.warning(f"Connection error for {prefix_str}, retry {attempt + 1}/{RETRY_ATTEMPTS}")
+                        time.sleep(RETRY_DELAY)
+                    else:
+                        errors += 1
+                        if errors <= 20:
+                            logger.error(f"Prefix {prefix_str} failed: {e}")
+                        break
+                        
+                except Exception as e:
+                    if attempt < RETRY_ATTEMPTS - 1 and is_connection_error(e):
+                        logger.warning(f"Connection error for {prefix_str}, retry {attempt + 1}/{RETRY_ATTEMPTS}")
+                        time.sleep(RETRY_DELAY)
+                    else:
+                        errors += 1
+                        if errors <= 20:
+                            logger.error(f"Prefix {prefix_str} failed: {e}")
+                        break
     
-    logger.info(f"Prefixes Complete: {created} created, {skipped} skipped, {errors} errors")
-
+    logger.info(f"Subnets Complete: {prefixes_created} prefixes created, {addresses_created} IPs created, "
+                f"{skipped} skipped, {errors} errors")
 
 def migrate_addresses(nb):
     """Migrate individual IP addresses with rate limiting and smart retries"""
