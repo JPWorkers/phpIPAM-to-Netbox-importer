@@ -41,7 +41,7 @@ Tested with:
 - NetBox 4.0+
 - Ubuntu 22.04 / 24.04 LTS
 - Python 3.10+
-
+```
 
 
 ## 📁 Project Structure
